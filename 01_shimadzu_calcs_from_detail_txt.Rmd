@@ -1,0 +1,551 @@
+---
+title: "Calculating Standard Curves and Sample Concentration (mg/L) from Shimadzu TOC-L Detail Export"
+author: "Hava Blair"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    df_print: paged
+---
+
+```{r setup, message = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(tidy.opts = list(width.cutoff=60))
+
+library(tidyverse)
+library(glue)
+library(lubridate)
+library(gridExtra)
+
+```
+
+## 0 Overview  
+
+### 0.1 Data Sources
+
+This workflow uses the "detailed" data export from the Shimadzu, as a `.txt` file. I also use a "vial key" below which is a spreadsheet indicating which sample number was in which vial number for a given run.  If you took the time to type your sample numbers into the Shimadzu data table before the run, the vial key won't be needed.
+
+## 1 Set-up 
+
+### 1.1 Load data 
+
+Update path to raw Shimadzu data file (.txt). 
+
+```{r, message=FALSE}
+
+txt_path <- "raw-data/20210409_demo_data_detail_report.txt"
+
+# extract run date
+# I use run date as a key to join vial data
+# (which sample was in which Shimadzu vial number)
+# not necessary if you typed your sample numbers into Shimadzu data table
+target_run_date <- str_extract(txt_path, "[:digit:]{8}")
+
+path_to_vial_key <- "metadata/key_to_shimadzu_runs.csv"
+
+vial_key <- read_csv(path_to_vial_key) %>% 
+  select(sh_run_date, vial_number, dilution_factor) %>% 
+  filter(sh_run_date == target_run_date)
+
+head(vial_key)
+
+# read in Shimadzu data
+s_raw <- read_tsv(txt_path, skip = 10) %>%
+  select(
+    "Type",
+    "Sample Name",
+    "Sample ID", 
+    "Date / Time", 
+    "Inj. No.",
+    "Analysis(Inj.)",
+    "Area",
+    "Conc.",
+    "Vial", 
+    "Excluded"
+  )
+```
+
+### 1.3 Clean up column names 
+
+
+```{r}
+# look at colnames
+colnames(s_raw)
+
+# nicer column names
+colnames(s_raw) <-
+  c(
+    "type",
+    "sample_name",
+    "sample_id",
+    "date_time",
+    "inj_no",
+    "analysis_inj",
+    "area",
+    "conc",
+    "vial",
+    "excluded"
+  )
+```
+
+### 1.4 Join data and vial key 
+
+
+
+```{r}
+s_join <- left_join(s_raw, vial_key, by = c("vial" = "vial_number")) 
+
+head(s_join)
+
+# helpful to check this to confirm your join worked as expected
+# should have same number of rows before and after join
+nrow(s_join) == nrow(s_raw)
+```
+
+
+### 1.5 Drop bad data, parse date times 
+
+In the Shimadzu data, 1 in the "excluded" column means it was a bad injection, as determined by an automatic calculation of % coefficient variation the software does as each sample is run.  CHECK if this is 5% or 10% threshold? 
+
+```{r}
+# drop excluded injections 
+e <- s_join %>% 
+  filter(excluded !=1)
+
+# parse date times so we can add/subtract/determine intervals
+p <- e %>% 
+  mutate(date_time = mdy_hms(date_time))
+
+# take a look
+head(p)
+
+```
+
+
+## 2 Standards 
+
+### 2.1 Extract standard data
+
+Select just the standard data.  If your sample IDs for standards are something other than "Std", remember to change this below
+
+```{r}
+
+stds <- p %>%
+  filter(sample_name != "FLUSH") %>% # drop flushes
+  filter(str_detect(sample_id, "Std")) # select standards
+
+# take a look
+head(stds)
+
+```
+
+### 2.2 Determine standard run times
+
+Recall that we typically run 4 combined standards in a full Shimadzu run.  "Combined" means that we mix the NPOC and TN standard solutions in a single vial.  
+
+Because we have parsed the date time column above, we can use some functions from the `lubridate` package to define a time interval that each standard set was run.  
+
+```{r}
+# sample_id is the unique identifier
+# example "NPOC Std 1", "NPOC Std 2", etc
+stds_times <- stds %>%
+  group_by(sample_id) %>% # for each std vial
+  summarise(
+    std_start = min(date_time), # find start time
+    std_end = max(date_time), # find end time
+    .groups = "drop"
+  ) %>%
+  mutate(
+    std_number = as.integer(str_extract(sample_id, "[:digit:]")), # extract std number
+    std_type = str_extract(sample_id, "[:alpha:]*") # was it C or N?
+  ) %>%
+  column_to_rownames(var = "sample_id") # for readable indexing by rowname below
+
+stds_times
+```
+
+
+### 2.3 Define which stds go with which samples 
+
+To determine sample NPOC and TN concentrations, we want to use the most recently generated standard curve (there are 4 in each run).  So for each set of sample vials, we will determine which standard curve immediately preceded them by using the timestamps provided by the machine. 
+
+Also recall that for the 0ppm point in the standard curve, the Shimadzu draws Vial 0 (MilliQ Water)
+
+Example sequence (note  not all runs have these exact numbers): 
+
+Vial 1: Std 1  (NPOC, TN)  
+Vial 2-30:  Samples  (Match with Std Curve 1)  
+Vial 31: Std 2 (NPOC, TN)  
+Vial 32-60: Samples  (Match with Std Curve 2)  
+Vial 61: Std 3 (NPOC, TN)  
+Vial 62-92: Samples  (Match with Std Curve 3)  
+Vial 93: Std 4 (NPOC, TN)  
+
+The function below defines the time intervals that correspond to each standard curve.  Samples with a time stamp after Std Curve 1 but before Std Curve 2 will be analyzed with the values from this Std Curve 1.  Samples with time stamps after Std Curve 2 but before 3 will be analyzed with values from Std Curve 2, etc. 
+
+
+```{r}
+
+define_std_sample_intervals <- function(df) {
+  t <- data.frame(std_id = c(1, 2, 3, 4))
+  
+  t <-  t %>%
+    mutate(
+      sample_interval = case_when(
+        # assign std curve 1 if samples were run after std 1, but before std 2
+        std_id == 1 ~ interval(df["TN Std 1", "std_end"], df["NPOC Std 2", "std_start"]),
+        # assign std curve 2 if samples were run after std 2, but before std 3
+        std_id == 2 ~ interval(df["TN Std 2", "std_end"], df["NPOC Std 3", "std_start"]),
+        # assign std curve 3 if samples were run after std 3, but before std 4
+        std_id == 3 ~ interval(df["TN Std 3", "std_end"], df["NPOC Std 4", "std_start"]),
+        # because no samples are run after Std 4, this interval doesn't really matter
+        # setting it to be the duration of the 4th std for the sake of completing the table
+        TRUE ~ interval(df["NPOC Std 4", "std_start"], df["TN Std 4", "std_end"])
+      )
+    ) %>%
+    column_to_rownames(var = "std_id") # for readable indexing below
+  
+  return(t)
+  
+}
+
+
+sample_intervals <- define_std_sample_intervals(stds_times)
+
+
+sample_intervals
+```
+
+### 2.3 Match standard curve ids to all samples
+
+Assign which standard curve applies to each sample in the dataset.
+
+```{r}
+# drop flushes and standards (keep only sample data)
+samples <- p %>% 
+  filter(!str_detect(sample_id, "FLUSH")) %>% 
+  filter(!str_detect(sample_id, "Std"))
+
+# check how many rows before filtering
+nrow(p)
+# check how many rows after filtering
+nrow(samples)
+
+# function to match up std curve id with each sample
+# looks at time stamp for each sample 
+# assigns sample to appropriate std curve
+match_to_std_curve <- function(data, sample_intervals, ...){
+  
+  data %>% 
+    mutate(std_id = case_when(
+      date_time %within% sample_intervals["1", "sample_interval"] ~ 1,
+      
+      date_time %within% sample_intervals["2", "sample_interval"] ~ 2,
+      
+      date_time %within% sample_intervals["3", "sample_interval"] ~ 3,
+      # the final standard curve is a used as a check, but 
+      # isn't used for any of the calculations
+      TRUE ~ 8888
+      
+    ))
+  
+}
+
+data_with_std_ids <- match_to_std_curve(samples, sample_intervals)
+
+head(data_with_std_ids)
+
+```
+
+
+### 2.4 Standard curve calculations and graphs 
+
+#### 2.4.1 Define Linear Model Functions 
+
+These are some helper functions we will use when calculating and plotting our standard curves.
+
+```{r}
+#function to run a linear model 
+# x = concentration (NPOC or TN Std), 
+# y = area under injection peak (mean of all inj for given conc)
+
+lm_mod_ftn <- function(df){
+  lm(mean_area ~ conc, data = df)
+}
+
+# function to extract R^2 from linear model details
+
+r_sq_fun <- function(mod){
+  summary(mod)[["r.squared"]]
+}  
+
+# function to extract y intercept from linear model details
+b_fun <- function(mod){
+  coefficients(mod)[[1]]
+}
+
+# function to extract slope (m) from linear model details
+slope_fun <- function(mod){
+  coefficients(mod)[[2]]
+}
+```
+
+
+#### 2.4.2  Standards - mean area under curve
+
+Calculate the mean area under the curve for each point along the standard curves.
+
+```{r}
+
+# recall that above we created the `stds` object
+# this contains all the std injection data 
+head(stds)
+
+# calculate mean values for std data 
+
+calc_std_means <- function(std_df){
+  
+  s <- std_df %>% 
+    group_by(sample_id, conc) %>% 
+  summarise(mean_area = round(mean(area),4),
+            .groups = "drop")
+  # rounding to 4 digits here because it 
+  # matches shimadzu export precision
+}
+
+# calculate mean area under injection peaks for all standard concentrations
+std_means <- calc_std_means(stds)
+
+# take a look
+head(std_means)
+
+```
+
+#### 2.4.3 Linear regression 
+
+Here we start working with some nested data structures (`data` and `lmod`): [list columns](https://r4ds.hadley.nz/rectangling.html#list-columns). We are storing our standards dataframes and our model objects in list columns. This is a convenient way to keep our data organized, but can be confusing if you haven't encountered them before. See the preceding link for more information.   
+
+```{r}
+
+# stats for std curves 
+# functions defined in section 2.4.1
+
+calc_lm <- function(std_means){
+  
+  # sample_id contains unique std id
+  # nest by this variable so we can
+  # run lm on each std curve (8 total: 4 NPOC, 4 TN)
+  n <- std_means %>% 
+  group_by(sample_id) %>% 
+  nest() 
+  
+  # organize lm info in one dataframe
+  s <- n %>% 
+     mutate(l_mod = map(data, lm_mod_ftn), 
+         slope = map_dbl(l_mod, slope_fun), 
+         intercept = map_dbl(l_mod, b_fun),
+         rsq = map_dbl(l_mod, r_sq_fun), 
+         std_number = str_extract(sample_id, "[:digit:]"), 
+         std_type = str_extract(sample_id, "[:alpha:]*"))
+  
+  return(s)
+  
+} 
+
+std_calcs <- calc_lm(std_means)
+
+std_calcs
+```
+
+#### 2.4.4 Plots  
+
+Inspect standard curve plots, identify any failed standard curves.  If you have any bad ones, will need to make a decision about what to do and customize the code in section 3.2 so the bad numbers aren't used to calculate sample concentrations. 
+
+```{r}
+shimadzu_std_graph <-
+  function(sample_id, data, slope, intercept, rsq, ...) {
+    
+    # using ... to absorb extra cols (args) in df that I don't use in this function, see https://purrr.tidyverse.org/reference/map2.html
+    
+   g <-  ggplot() +
+      
+      geom_point(data = data, aes(x = conc, y = mean_area)) +
+      
+      geom_abline(aes(slope = slope, intercept = intercept)) +
+      
+      geom_text(aes(
+        x = 8,
+        y = 1,
+        label = paste("R^2=", round(rsq, digits = 4))
+      ),
+      size = 4,
+      inherit.aes = FALSE) +
+      geom_text(aes(
+        x = 3,
+        y = 30,
+        label = paste(
+          " y= ",
+          round(slope, digits = 4),
+          "x",
+          " + ",
+          round(intercept, digits = 4)
+        )
+      ),
+      size = 4,
+      inherit.aes = FALSE) +
+      
+      ggtitle(glue("{sample_id}"))
+  
+    return(g)
+  }
+
+std_plots <- pmap(std_calcs, shimadzu_std_graph)
+
+npoc_plots <- std_plots[1:4]
+
+#npoc_plots <- std_plots[1:2]
+
+grid.arrange(grobs = npoc_plots, ncol = 2)
+
+tn_plots <- std_plots[5:8]
+#tn_plots <- std_plots[3:4] 
+
+grid.arrange(grobs = tn_plots, ncol = 2)
+```
+
+# 3. Calculating NPOC and TN for samples 
+
+## 3.1 Samples - mean area under curve
+
+Recall that we excluded the bad injections earlier in section 1.2.  Recall also that each sample has a standard curve assigned to it (`std_id`). 
+
+```{r}
+# sample data 
+sample_peak_areas <- data_with_std_ids %>% 
+  select(vial, analysis_inj, inj_no, area, std_id)
+
+# calculate mean area for each sample, for both NPOC & TN
+mean_peak_areas <- sample_peak_areas %>% 
+  group_by(vial, analysis_inj, std_id) %>% 
+  summarise(mean_area = mean(area), 
+            .groups = "drop")
+
+head(mean_peak_areas)
+
+
+```
+
+## 3.2 Match up std curve stats with samples 
+
+```{r}
+# pull slope and intercept data from std curve calculations
+std_stats <- std_calcs %>% 
+  ungroup() %>% 
+  mutate(std_id = as.numeric(std_number)) %>% 
+  select(std_id, std_type, slope, intercept) %>% 
+  rename(analysis_inj = std_type)
+
+# take a look
+std_stats
+
+
+# match std curve info with samples
+# based on std_id assigned in section 2.3 
+data_with_std_stats <- left_join(mean_peak_areas, std_stats, by = c("std_id", "analysis_inj"))
+
+# take a look
+head(data_with_std_stats)
+
+```
+
+## 3.3  Calculate NPOC and TN in mg/L
+
+sample mg/L  = (sample_mean_area - std_intercept)/std_slope 
+
+Including "temp" in the variable name here as a reminder that you aren't done yet when calculating concentration -- need to account for the dilution that you do during the Shimadzu sample prep (See section 3.4).  
+
+```{r}
+ 
+sample_conc <- data_with_std_stats %>%
+  mutate(conc_mg_L = (mean_area - intercept) / slope) %>%
+  select(vial, analysis_inj, conc_mg_L) %>%
+  pivot_wider(names_from = analysis_inj,
+              values_from = conc_mg_L,
+              names_prefix = "temp_mg_L_")
+
+head(sample_conc)  
+
+
+```
+
+
+## 3.4 Account for dilution 
+
+Now we need to account for the fact that we diluted our soil extracts in DDI water (plus a little HCl) before running them on the Shimadzu.  This will be specific to the analysis you are doing (microbial biomass, WEOC/WEON, etc).  
+
+In my case, samples were either diluted:
+
+-   3 mL extract in 20mL total volume (20/3 = 6.6667 dilution factor), the standard dilution in the CFE (MB) protocol, seems to work for many agricultural soil samples
+-   1.5 mL extract in 20 mL total volume (20/1.5 = 13.3333 dilution factor), had to use this for all of my "natural area" (unfarmed) samples, and a few of the high clay / high OM samples I collected from agricultural fields.  
+- 1 mL extract in 20mL  total volume (20/1 = 20 dilution factor)  
+
+In my `data_with_std_ids` dataframe from section 2.3 , the "dilution_factor" column has:
+
+-   `NA` if the sample was not diluted (meaning I used the standard 3 mL of extract)  
+-   `0.5` if I used half the normal volume, or 1.5 mL extract 
+- `0.33` if I used one third of the normal volume, or 1 mL extract 
+
+
+```{r}
+# grab the dilution factor data
+dil <- data_with_std_ids %>%
+  select(vial, dilution_factor) %>% 
+  distinct()
+
+# join dilution data with sample data based on vial number
+sample_conc_dil <- left_join(sample_conc, dil, by = "vial")
+
+# calculate concentration of original extract (before dilution)
+corrected_conc <- sample_conc_dil %>% 
+  mutate(dilution_factor = case_when(
+    is.na(dilution_factor) ~ 6.6667,
+    dilution_factor == 0.5 ~ 13.3333, 
+    dilution_factor == 0.33 ~ 20,
+    TRUE ~ 8888 # this is a "missing data" code
+  ),
+  NPOC_mg_L = dilution_factor * temp_mg_L_NPOC,
+  TN_mg_L = dilution_factor * temp_mg_L_TN) %>% 
+  select(-c(temp_mg_L_NPOC, temp_mg_L_TN, dilution_factor)) 
+
+# take a look
+head(corrected_conc)
+
+# a full run should have 88 or 89 rows
+nrow(corrected_conc)
+
+```
+# 4 Save final calculation
+
+We have now calculated the concentration of NPOC or TN in our original extract.  If this was a soil extract, you need to do further calculations to determine the amount of C or N on a soil dry mass basis.  Because this step is specific to the extraction performed, I have chosen to implement it in another script.  
+
+Save data.  Update file path as needed.  I always use the ISO date of my Shimadzu run (YYYYMMDD) as a "barcode" to identify the data and match it up with relevant metadata like the sample names, sample mass, etc.  You may have a different scheme to implement here based on your experimental design.  
+
+`target_run_date` is defined in Section 1.1
+
+
+```{r}
+
+# make a directory called "temp" if one does not already exist
+ifelse(dir.exists("temp"), print("temp directory exists"), dir.create("temp"))
+
+# build path to save data
+# recall that "target_run_date" is defined in sec 1.1
+# in the unlikely event that you have multiple runs with the same target date,
+# change this path so that your runs are uniquely identified
+results_path <- glue("./temp/{target_run_date}_npoc_tn_calcs.csv")
+
+# save data
+write_csv(x = corrected_conc, file = results_path)
+
+
+```
+
